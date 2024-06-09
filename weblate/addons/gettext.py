@@ -4,17 +4,32 @@
 
 from __future__ import annotations
 
+import itertools
 import os
+import tempfile
+from typing import TYPE_CHECKING
 
 from django.core.management.utils import find_command
 from django.utils.translation import gettext_lazy
 
 from weblate.addons.base import BaseAddon, StoreBaseAddon, UpdateBaseAddon
 from weblate.addons.events import AddonEvent
-from weblate.addons.forms import GenerateMoForm, GettextCustomizeForm, MsgmergeForm
+from weblate.addons.forms import (
+    GenerateMoForm,
+    GettextCustomizeForm,
+    MsgmergeForm,
+    XGettextForm,
+)
 from weblate.formats.base import UpdateError
 from weblate.formats.exporters import MoExporter
+from weblate.trans.util import cleanup_path
 from weblate.utils.state import STATE_FUZZY, STATE_TRANSLATED
+
+if TYPE_CHECKING:
+    from weblate.auth.models import User
+
+if TYPE_CHECKING:
+    from weblate.trans.models import Component
 
 
 class GettextBaseAddon(BaseAddon):
@@ -326,6 +341,9 @@ class GettextCustomizeAddon(GettextBaseAddon, StoreBaseAddon):
             return ["--no-wrap"]
         return []
 
+    def get_xgettext_args(self, component):
+        return self.get_msgmerge_args(component)
+
 
 class GettextAuthorComments(GettextBaseAddon):
     events = (AddonEvent.EVENT_PRE_COMMIT,)
@@ -349,3 +367,161 @@ class GettextAuthorComments(GettextBaseAddon):
 
         translation.store.store.updatecontributor(name, email)
         translation.store.save()
+
+
+class XGettextAddon(GettextBaseAddon):
+    name = "weblate.gettext.xgettext"
+    verbose = gettext_lazy("Update POT file (xgettext)")
+    description = gettext_lazy("Updates POT file using xgettext.")
+    alert = "XGettextAddonError"
+    settings_form = XGettextForm
+    events = (AddonEvent.EVENT_POST_UPDATE,)
+
+    @classmethod
+    def can_install(cls, component: Component, user: User) -> bool:
+        if not super().can_install(component, user):
+            return False
+        return component.new_base and find_command("xgettext")
+
+    def get_directory(self) -> str:
+        path = self.instance.configuration.get("directory", "")
+        return "" if path == "." else path
+
+    def get_files_from(self, component: Component) -> str | None:
+        base = component.get_new_base_filename()
+        if base is None:
+            return None
+        filename = self.instance.configuration.get("files_from", "POTFILES.in")
+        return os.path.join(os.path.dirname(base), filename)
+
+    def get_xgettext_args(self, component: Component) -> list[str]:
+        args = [f"--files-from={self.get_files_from(component)}"]
+        if directory := self.get_directory():
+            args.append(f"--directory={directory}")
+        if from_code := self.instance.configuration.get("from_code", "UTF-8"):
+            args.append(f"--from-code={from_code}")
+        if self.instance.configuration.get("add_comments", False):
+            args.append("--add-comments")
+        else:
+            comment_tags = self.instance.configuration.get("add_comments_tags", "")
+            args.extend(
+                f"--add-comments={tag}" for tag in comment_tags.splitlines() if tag
+            )
+        if self.instance.configuration.get("no_default_keywords", False):
+            args.append("--keyword")
+        args.extend(
+            f"--keyword={keyword}"
+            for keyword in self.instance.configuration.get("keywords", "").splitlines()
+            if keyword
+        )
+        args.extend(
+            f"--flag={flag}"
+            for flag in self.instance.configuration.get("flags", "").splitlines()
+            if flag
+        )
+        if bug_address := component.report_source_bugs:
+            args.append(f"--msgid-bugs-address={bug_address}")
+        # Apply gettext customize add-on configuration
+        if customize_addon := component.get_addon(GettextCustomizeAddon.name):
+            args.extend(customize_addon.addon.get_xgettext_args(component))
+        return args
+
+    @staticmethod
+    def load_file_list(path: str) -> list[str]:
+        # parse POTFILES.in like gettext does (gettext-tools/src/file-list.c)
+        # https://git.savannah.gnu.org/gitweb/?p=gettext.git;a=blob;f=gettext-tools/src/file-list.c
+        with open(path) as f:
+            return [
+                line.rstrip("\n").rstrip(" \t\r")
+                for line in f
+                if line and not line.startswith("#")
+            ]
+
+    @staticmethod
+    def is_pot_creation_date(line: str) -> bool:
+        if line is None:
+            return False
+        return line.startswith('"POT-Creation-Date: ') and line.endswith('\\n"\n')
+
+    @staticmethod
+    def pot_files_same(file_a: str, file_b: str) -> bool:
+        with open(file_a) as f_a, open(file_b) as f_b:
+            for line_a, line_b in itertools.zip_longest(f_a, f_b):
+                if line_a != line_b:
+                    if not XGettextAddon.is_pot_creation_date(line_a):
+                        return False
+                    if not XGettextAddon.is_pot_creation_date(line_b):
+                        return False
+        return True
+
+    def post_update(
+        self, component: Component, previous_head: str, skip_push: bool, child: bool
+    ) -> None:
+        output = self.get_new_base_filename()
+        files_from = self.get_files_from(component)
+        if not files_from or not os.path.exists(files_from):
+            self.alerts.append(
+                {
+                    "addon": self.name,
+                    "command": "xgettext",
+                    "output": output,
+                    "error": "Input list (POTFILES.in) file not found",
+                }
+            )
+            self.trigger_alerts(component)
+            component.log_info("%s addon skipped, input file list not found", self.name)
+            return
+        input_files = self.load_file_list(files_from)
+        directory = self.get_directory()
+        repo_files = {
+            cleanup_path(os.path.join(directory, input_path))
+            for input_path in input_files
+        }
+        # Run always when there are alerts, there is a chance that
+        # the update clears it.
+        repository = component.repository
+        if previous_head and not component.alert_set.filter(name=self.alert).exists():
+            changes = set(
+                repository.list_changed_files(
+                    repository.ref_to_remote.format(previous_head)
+                )
+            )
+            if not (changes & repo_files):
+                component.log_info(
+                    "%s addon skipped, input files not updated in %s..%s",
+                    self.name,
+                    previous_head,
+                    repository.last_revision,
+                )
+                return
+        try:
+            for repo_path in repo_files:
+                component.repository.resolve_symlinks(repo_path)
+        except (OSError, ValueError) as ex:
+            self.alerts.append(
+                {
+                    "addon": self.name,
+                    "command": "xgettext",
+                    "output": output,
+                    "error": str(ex),
+                }
+            )
+            self.trigger_alerts(component)
+            component.log_info(
+                "%s addon skipped, input file list is invalid: %s", self.name, ex
+            )
+            return
+        args = self.get_xgettext_args(component)
+        with tempfile.NamedTemporaryFile(
+            dir=os.path.dirname(output), delete_on_close=False
+        ) as tmpfile:
+            tmpfile.close()
+            self.execute_process(component, ["xgettext", *args, "-o", tmpfile.name])
+            if self.alerts:
+                self.trigger_alerts(component)
+                return
+            if os.path.exists(output) and self.pot_files_same(tmpfile.name, output):
+                component.log_info("%s addon: no updates", self.name)
+                return
+            os.replace(tmpfile.name, output)
+        self.commit_and_push(component, [self.new_base], skip_push=skip_push)

@@ -147,6 +147,93 @@ class MsgmergeForm(BaseAddonForm):
     )
 
 
+class XGettextForm(BaseAddonForm):
+    files_from = forms.CharField(
+        label=gettext_lazy("Input list file name"),
+        required=True,
+        initial="POTFILES.in",
+        help_text=gettext_lazy(
+            "Get list of input files from this file, in the same directory as "
+            "the .pot file ('xgettext -f'/'xgettext --files-from')"
+        ),
+    )
+    directory = forms.CharField(
+        label=gettext_lazy("Base directory"),
+        required=False,
+        initial=".",
+        help_text=gettext_lazy(
+            "Input file paths will be interpreted relative to this directory "
+            "('xgettext -D'/'xgettext --directory')"
+        ),
+    )
+    from_code = forms.CharField(
+        label=gettext_lazy("Input file encoding"),
+        required=False,
+        initial="UTF-8",
+        help_text=gettext_lazy("Encoding of input files ('xgettext --from-code')"),
+    )
+    keywords = forms.CharField(
+        widget=forms.Textarea(),
+        label=gettext_lazy("Additional keywords"),
+        required=False,
+        initial="",
+        help_text=gettext_lazy(
+            "List of additional keywords ('xgettext -k'/'xgettext --keyword'), "
+            "one keyword per line"
+        ),
+    )
+    no_default_keywords = forms.BooleanField(
+        label=gettext_lazy("Do not use default keywords"),
+        required=False,
+        initial=False,
+        help_text=gettext_lazy(
+            "Do not use default keywords ('xgettext -k'/'xgettext --keyword')"
+        ),
+    )
+    flags = forms.CharField(
+        widget=forms.Textarea(),
+        label=gettext_lazy("Additional flags"),
+        required=False,
+        initial="",
+        help_text=gettext_lazy(
+            "List of additional flags ('xgettext --flag'), one flag per line"
+        ),
+    )
+    add_comments = forms.BooleanField(
+        label=gettext_lazy("Add comments without tags"),
+        required=False,
+        initial=False,
+        help_text=gettext_lazy(
+            "Place all comment blocks preceding keyword lines in output file "
+            "('xgettext -c'/'xgettext --add-comments')"
+        ),
+    )
+    add_comments_tags = forms.CharField(
+        widget=forms.Textarea(),
+        label=gettext_lazy("Comment tags"),
+        required=False,
+        initial="",
+        help_text=gettext_lazy(
+            "Place comment blocks starting with TAG and preceding keyword "
+            "lines in output file ('xgettext -c'/'xgettext --add-comments), "
+            "one tag per line"
+        ),
+    )
+
+    def test_render(self, value) -> None:
+        validate_render_component(value, translation=True)
+
+    def clean_files_from(self):
+        self.test_render(self.cleaned_data["files_from"])
+        validate_filename(self.cleaned_data["files_from"])
+        return self.cleaned_data["files_from"]
+
+    def clean_directory(self):
+        self.test_render(self.cleaned_data["directory"])
+        validate_filename(self.cleaned_data["directory"])
+        return self.cleaned_data["directory"]
+
+
 class GitSquashForm(BaseAddonForm):
     squash = forms.ChoiceField(
         label=gettext_lazy("Commit squashing"),
